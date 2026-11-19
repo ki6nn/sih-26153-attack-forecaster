@@ -8,3 +8,6 @@ artifacts/*.pt
 artifacts/*.pkl
 .DS_Store
 .vscode/
+
+.agents/
+.claude/
