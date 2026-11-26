@@ -3,17 +3,22 @@
 from src.pipeline.features import (
     CICIDS2017_FEATURES,
     UNSW_NB15_FEATURES,
+    detect_feature_anomalies,
     encode_categorical_features,
     extract_features,
     get_feature_columns,
     map_stage_labels,
 )
 from src.pipeline.ingestion import (
+    DATASET_SPECS,
+    DatasetProvenance,
+    compute_file_sha256,
     load_csv_chunks,
     load_dataset,
     normalize_column_names,
     parse_timestamps,
     record_source_provenance,
+    verify_dataset_provenance,
 )
 from src.pipeline.preprocessor import (
     NetworkDataPreprocessor,
@@ -37,6 +42,11 @@ from src.pipeline.windowing import (
 )
 
 __all__ = [
+    "DATASET_SPECS",
+    "DatasetProvenance",
+    "compute_file_sha256",
+    "verify_dataset_provenance",
+    "detect_feature_anomalies",
     "load_csv_chunks",
     "normalize_column_names",
     "parse_timestamps",

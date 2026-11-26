@@ -4,12 +4,14 @@
 """
 
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from src.contracts import FORECAST_STEPS, NUM_FEATURES, WINDOW_SIZE
 from src.pipeline.features import CICIDS2017_FEATURES, UNSW_NB15_FEATURES
+from src.pipeline.ingestion import DatasetProvenance
 from src.pipeline.preprocessor import (
     NetworkDataPreprocessor,
     prepare_research_pipeline,
@@ -22,12 +24,25 @@ class TestPipelineIntegration(unittest.TestCase):
     def setUp(self) -> None:
         self.n_samples = 300
         # Construct synthetic chronological UNSW-NB15 shaped DataFrame
-        feature_dict = {feat: np.random.default_rng(i).normal(loc=10.0 + i, scale=2.0, size=self.n_samples)
-                        for i, feat in enumerate(UNSW_NB15_FEATURES)}
+        feature_dict = {
+            feat: np.random.default_rng(i).normal(loc=10.0 + i, scale=2.0, size=self.n_samples)
+            for i, feat in enumerate(UNSW_NB15_FEATURES)
+        }
         feature_dict["timestamp"] = pd.date_range("2026-01-01 10:00:00", periods=self.n_samples, freq="1s")
         feature_dict["dur"] = [0.1] * self.n_samples
         feature_dict["attack_cat"] = ["Normal"] * 200 + ["Exploits"] * 50 + ["DoS"] * 50
         self.df_unsw = pd.DataFrame(feature_dict)
+
+        # Official mock provenance record for unit testing research pipeline
+        self.mock_prov = DatasetProvenance(
+            dataset_name="unsw_nb15",
+            provenance_type="official_research",
+            source_url="https://research.unsw.edu.au/projects/unsw-nb15-dataset",
+            dataset_version="UNSW-NB15 Mock Research Fixture",
+            filename="mock_unsw.csv",
+            is_research_evidence=True,
+        )
+        self.df_unsw.attrs["provenance"] = self.mock_prov
 
     def test_research_pipeline_end_to_end_no_leakage(self) -> None:
         """Verify that prepare_research_pipeline executes end-to-end with zero full-dataset scaler fitting."""
@@ -41,9 +56,7 @@ class TestPipelineIntegration(unittest.TestCase):
             duration_unit="s",
         )
 
-        # 1. Scaler center and scale must match training partition mean/std ONLY
-        train_rows = len(pipe_data.intervals_train) + WINDOW_SIZE + FORECAST_STEPS - 1
-        # The preprocessor sample_count metadata must strictly equal training sample count, not full 300
+        # 1. Preprocessor sample_count metadata must strictly equal training sample count, not full 300
         self.assertLess(pipe_data.preprocessor.metadata_["sample_count"], self.n_samples)
 
         # 2. Partitions must all have valid windows
@@ -71,6 +84,7 @@ class TestPipelineIntegration(unittest.TestCase):
             val_ratio=0.20,
             timestamp_col="timestamp",
             duration_col="dur",
+            duration_unit="s",
         )
 
         # Max target time of training windows
@@ -95,10 +109,102 @@ class TestPipelineIntegration(unittest.TestCase):
 
     def test_missing_timestamps_cannot_enter_research_pipeline(self) -> None:
         """Verify that missing timestamp data cannot enter the research pipeline."""
-        df_no_ts = self.df_unsw.drop(columns=["timestamp"])
+        df_no_ts = self.df_unsw.copy()
+        df_no_ts = df_no_ts.drop(columns=["timestamp"])
+        df_no_ts.attrs["provenance"] = self.mock_prov
         with self.assertRaises(ValueError) as ctx:
             prepare_research_pipeline(df_no_ts, dataset_name="unsw_nb15")
-        self.assertIn("No valid timestamp column found", str(ctx.exception))
+        self.assertIn("no valid timestamp column found", str(ctx.exception).lower())
+
+    def test_strict_provenance_enforcement_rejected_without_provenance(self) -> None:
+        """DataFrames without verified provenance must be rejected in research mode."""
+        df_unverified = self.df_unsw.copy()
+        df_unverified.attrs.clear()
+        with self.assertRaises(ValueError) as ctx:
+            prepare_research_pipeline(df_unverified, dataset_name="unsw_nb15", enforce_provenance=True)
+        self.assertIn("requires explicit dataset provenance", str(ctx.exception))
+
+    def test_synthetic_demo_cannot_enter_research_pipeline(self) -> None:
+        """sample_demo.csv must be strictly blocked from entering research evaluation."""
+        demo_path = Path("data/sample_demo.csv")
+        if demo_path.exists():
+            with self.assertRaises(ValueError) as ctx:
+                prepare_research_pipeline(demo_path, dataset_name="unsw_nb15", enforce_provenance=True)
+            self.assertIn("strictly rejected for empirical research", str(ctx.exception))
+
+    def test_missing_target_labels_rejected(self) -> None:
+        """Research pipeline must fail closed when target label columns are absent."""
+        df_no_labels = self.df_unsw.drop(columns=["attack_cat"])
+        df_no_labels.attrs["provenance"] = self.mock_prov
+        with self.assertRaises(ValueError) as ctx:
+            prepare_research_pipeline(df_no_labels, dataset_name="unsw_nb15")
+        self.assertIn("target label column missing", str(ctx.exception).lower())
+
+    def test_null_target_labels_rejected(self) -> None:
+        """Target labels containing null/NaN values must fail loudly."""
+        df_null_label = self.df_unsw.copy()
+        df_null_label.iloc[10, df_null_label.columns.get_loc("attack_cat")] = np.nan
+        df_null_label.attrs["provenance"] = self.mock_prov
+        with self.assertRaises(ValueError) as ctx:
+            prepare_research_pipeline(df_null_label, dataset_name="unsw_nb15")
+        self.assertIn("null/empty/nan values", str(ctx.exception).lower())
+
+    def test_invalid_binary_label_rejected(self) -> None:
+        """Non-binary or negative values in 'label' column must be rejected."""
+        df_bad_label = self.df_unsw.copy()
+        df_bad_label = df_bad_label.drop(columns=["attack_cat"])
+        df_bad_label["label"] = [0] * 299 + [-1]  # Invalid -1
+        df_bad_label.attrs["provenance"] = self.mock_prov
+        with self.assertRaises(ValueError) as ctx:
+            prepare_research_pipeline(df_bad_label, dataset_name="unsw_nb15")
+        self.assertIn("invalid binary target label values", str(ctx.exception).lower())
+
+    def test_unknown_attack_category_rejected_in_strict_mode(self) -> None:
+        """Unrecognized attack categories in attack_cat must raise ValueError when allow_unknown_labels=False."""
+        df_unknown_cat = self.df_unsw.copy()
+        df_unknown_cat.iloc[10, df_unknown_cat.columns.get_loc("attack_cat")] = "unregistered_zero_day"
+        df_unknown_cat.attrs["provenance"] = self.mock_prov
+        with self.assertRaises(ValueError) as ctx:
+            prepare_research_pipeline(df_unknown_cat, dataset_name="unsw_nb15", allow_unknown_labels=False)
+        self.assertIn("unknown attack category labels detected", str(ctx.exception).lower())
+
+    def test_missing_duration_without_acknowledgment_raises(self) -> None:
+        """Omitting duration column without explicit zero-duration acknowledgment must raise ValueError."""
+        custom_features = [f"feat_{i}" for i in range(NUM_FEATURES)]
+        data = {f: [1.0] * 50 for f in custom_features}
+        data["timestamp"] = pd.date_range("2026-01-01 10:00:00", periods=50, freq="1s")
+        data["attack_cat"] = ["Normal"] * 50
+        df_no_dur = pd.DataFrame(data)
+        df_no_dur.attrs["provenance"] = self.mock_prov
+        with self.assertRaises(ValueError) as ctx:
+            prepare_research_pipeline(
+                df_no_dur,
+                dataset_name="custom",
+                feature_columns=custom_features,
+                duration_col=None,
+                acknowledge_zero_duration=False,
+            )
+        self.assertIn("flows cannot be assumed instantaneous", str(ctx.exception).lower())
+
+    def test_training_only_imputation_in_research_pipeline(self) -> None:
+        """Validation records with NaNs must be imputed using training medians and processed cleanly."""
+        df_with_nan = self.df_unsw.copy()
+        # Inject NaNs strictly into the validation region (rows 200..230)
+        df_with_nan.iloc[210, df_with_nan.columns.get_loc("dur")] = 0.1
+        df_with_nan.iloc[210, df_with_nan.columns.get_loc("spkts")] = np.nan
+        df_with_nan.attrs["provenance"] = self.mock_prov
+
+        pipe_data = prepare_research_pipeline(
+            df_with_nan,
+            dataset_name="unsw_nb15",
+            train_ratio=0.60,
+            val_ratio=0.20,
+            timestamp_col="timestamp",
+            duration_col="dur",
+            duration_unit="s",
+        )
+        self.assertFalse(np.isnan(pipe_data.X_val).any())
+        self.assertEqual(len(pipe_data.X_val), len(pipe_data.intervals_val))
 
     def test_invalid_durations_rejected_strictly(self) -> None:
         """Verify that non-numeric, NaN, infinite, negative durations and bad units raise ValueError."""

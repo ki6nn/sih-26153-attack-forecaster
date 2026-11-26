@@ -18,11 +18,17 @@ from src.contracts import (
 )
 from src.pipeline.features import (
     UNSW_NB15_FEATURES,
+    detect_feature_anomalies,
     extract_features,
     get_feature_columns,
     map_stage_labels,
 )
-from src.pipeline.ingestion import load_dataset
+from src.pipeline.ingestion import (
+    DATASET_SPECS,
+    DatasetProvenance,
+    load_dataset,
+    verify_dataset_provenance,
+)
 from src.pipeline.validation import validate_required_columns
 from src.pipeline.windowing import chronological_split, create_network_windows
 
@@ -55,6 +61,8 @@ class NetworkDataPreprocessor:
 
     Provides mathematical equivalence to StandardScaler or RobustScaler without
     requiring platform-specific C-extensions (fully compatible with Windows WDAC).
+    Enforces training-only imputation: missing/infinite values are imputed using
+    statistics calculated exclusively from the training partition.
     """
 
     def __init__(
@@ -62,17 +70,20 @@ class NetworkDataPreprocessor:
         method: str = "standard",
         feature_columns: Sequence[str] | None = None,
         clip_range: tuple[float, float] | None = (-10.0, 10.0),
+        impute_strategy: str | None = "median",
     ) -> None:
         self.method = method.lower()
         self.feature_columns = list(feature_columns) if feature_columns else list(FEATURE_COLUMNS)
         self.clip_range = clip_range
+        self.impute_strategy = impute_strategy.lower() if impute_strategy else None
         self.center_: np.ndarray | None = None
         self.scale_: np.ndarray | None = None
+        self.impute_values_: dict[str, float] = {}
         self.is_fitted: bool = False
         self.metadata_: dict[str, object] = {}
 
     def fit(self, X: pd.DataFrame | np.ndarray) -> "NetworkDataPreprocessor":
-        """Fit center and scale parameters strictly on training partition."""
+        """Fit center, scale, and imputation parameters strictly on training partition."""
         data = self._to_numpy(X)
         if data.ndim != 2:
             raise ValueError(f"Expected 2D input array, got shape {data.shape}")
@@ -81,14 +92,40 @@ class NetworkDataPreprocessor:
                 f"Expected {len(self.feature_columns)} features, got {data.shape[1]}"
             )
 
+        # 1. Fit training-only imputation values
+        self.impute_values_ = {}
+        imputed_data = np.copy(data)
+        for idx, col in enumerate(self.feature_columns):
+            col_vals = data[:, idx]
+            finite_mask = np.isfinite(col_vals)
+            finite_vals = col_vals[finite_mask]
+
+            if not finite_mask.all() and self.impute_strategy is None:
+                raise ValueError(
+                    f"Feature '{col}' contains non-finite values (NaN/Inf) and impute_strategy is None."
+                )
+
+            if len(finite_vals) == 0:
+                fill_val = 0.0
+            elif self.impute_strategy == "median":
+                fill_val = float(np.median(finite_vals))
+            elif self.impute_strategy == "mean":
+                fill_val = float(np.mean(finite_vals))
+            else:
+                fill_val = 0.0
+
+            self.impute_values_[col] = fill_val
+            imputed_data[~finite_mask, idx] = fill_val
+
+        # 2. Fit center and scale on imputed training partition
         if self.method == "standard":
-            center = np.mean(data, axis=0)
-            scale = np.std(data, axis=0)
+            center = np.mean(imputed_data, axis=0)
+            scale = np.std(imputed_data, axis=0)
             scale[scale < 1e-6] = 1.0
         elif self.method == "robust":
-            center = np.median(data, axis=0)
-            q75 = np.percentile(data, 75, axis=0)
-            q25 = np.percentile(data, 25, axis=0)
+            center = np.median(imputed_data, axis=0)
+            q75 = np.percentile(imputed_data, 75, axis=0)
+            q25 = np.percentile(imputed_data, 25, axis=0)
             scale = q75 - q25
             scale[scale < 1e-6] = 1.0
         else:
@@ -99,14 +136,16 @@ class NetworkDataPreprocessor:
         self.is_fitted = True
         self.metadata_ = {
             "method": self.method,
+            "impute_strategy": self.impute_strategy,
             "num_features": len(self.feature_columns),
             "feature_columns": self.feature_columns,
             "sample_count": int(data.shape[0]),
+            "impute_values": dict(self.impute_values_),
         }
         return self
 
     def transform(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
-        """Apply pre-computed scaling parameters without refitting."""
+        """Apply pre-computed training scaling and imputation parameters without refitting."""
         if not self.is_fitted or self.center_ is None or self.scale_ is None:
             raise RuntimeError("Preprocessor has not been fitted yet. Call fit() first.")
 
@@ -116,7 +155,16 @@ class NetworkDataPreprocessor:
                 f"Feature mismatch: expected shape (N, {len(self.feature_columns)}), got {data.shape}"
             )
 
-        scaled = (data - self.center_) / self.scale_
+        # Apply training-fitted imputation
+        imputed_data = np.copy(data)
+        for idx, col in enumerate(self.feature_columns):
+            col_vals = imputed_data[:, idx]
+            non_finite_mask = ~np.isfinite(col_vals)
+            if non_finite_mask.any():
+                fill_val = self.impute_values_.get(col, 0.0)
+                imputed_data[non_finite_mask, idx] = fill_val
+
+        scaled = (imputed_data - self.center_) / self.scale_
         if self.clip_range is not None:
             scaled = np.clip(scaled, self.clip_range[0], self.clip_range[1])
         return scaled.astype(np.float32)
@@ -160,24 +208,67 @@ class NetworkDataPreprocessor:
                 arr = X.to_numpy(dtype=np.float32)
         else:
             arr = np.asarray(X, dtype=np.float32)
-        arr = np.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
         return arr
 
 
 def _extract_partition_targets(
-    partition_df: pd.DataFrame, dataset_name: str
+    partition_df: pd.DataFrame,
+    dataset_name: str,
+    strict_labels: bool = True,
+    allow_unknown_labels: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Helper to extract binary attack labels and integer stage labels from a partition."""
+    """Helper to extract binary attack labels and integer stage labels from a partition.
+
+    Policy:
+        - Target label column is mandatory. If neither 'attack_cat' nor 'label' exists, raises ValueError.
+        - Null, empty string, or NaN labels raise ValueError; target labels cannot silently become benign.
+        - Invalid numeric values in 'label' (negative, non-binary) raise ValueError.
+        - Unknown attack categories map to 'Generic' with attack=1 (or raise ValueError if strict).
+        - MITRE stage mapping is a high-level heuristic categorization; it does NOT establish
+          verified MITRE ATT&CK enterprise technique attributions.
+
+    Raises:
+        ValueError: If target labels are missing, null, or invalid.
+    """
+    if "attack_cat" not in partition_df.columns and "label" not in partition_df.columns:
+        raise ValueError(
+            f"Target label column missing in partition. Required one of ('attack_cat', 'label'), "
+            f"found columns: {list(partition_df.columns[:10])}..."
+        )
+
     if "attack_cat" in partition_df.columns:
-        stages_mapped = map_stage_labels(partition_df["attack_cat"], dataset_name=dataset_name).to_numpy()
+        stages_mapped = map_stage_labels(
+            partition_df["attack_cat"],
+            dataset_name=dataset_name,
+            strict=strict_labels,
+            allow_unknown=allow_unknown_labels,
+        ).to_numpy()
         y_attack = (stages_mapped != "Normal").astype(int)
-    elif "label" in partition_df.columns:
-        raw_label = pd.to_numeric(partition_df["label"], errors="coerce").fillna(0).astype(int).to_numpy()
-        y_attack = (raw_label > 0).astype(int)
-        stages_mapped = np.where(y_attack == 0, "Normal", "Generic")
     else:
-        y_attack = np.zeros(len(partition_df), dtype=int)
-        stages_mapped = np.array(["Normal"] * len(partition_df))
+        # Binary 'label' column
+        raw_s = partition_df["label"]
+        null_mask = raw_s.isna() | raw_s.astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
+        if null_mask.any():
+            null_count = int(null_mask.sum())
+            raise ValueError(
+                f"Found {null_count} null or missing target labels in 'label' column. "
+                f"Target labels must be fully observed."
+            )
+        try:
+            numeric_label = pd.to_numeric(raw_s, errors="raise")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Non-numeric values found in target label column 'label': {exc}") from exc
+
+        invalid_mask = ~numeric_label.isin([0, 1, 0.0, 1.0])
+        if invalid_mask.any():
+            bad_vals = numeric_label[invalid_mask].unique().tolist()
+            raise ValueError(
+                f"Invalid binary target label values in 'label': {bad_vals}. "
+                f"Expected binary 0 (benign) or 1 (attack)."
+            )
+
+        y_attack = numeric_label.astype(int).to_numpy()
+        stages_mapped = np.where(y_attack == 0, "Normal", "Generic")
 
     stage_lookup = {stg: idx for idx, stg in enumerate(MITRE_STAGE_MAP)}
     y_stage = np.asarray([stage_lookup.get(stg, 0) for stg in stages_mapped], dtype=np.int64)
@@ -191,88 +282,169 @@ def prepare_research_pipeline(
     val_ratio: float = 0.15,
     timestamp_col: str | None = None,
     duration_col: str | None = None,
-    duration_unit: str = "s",
+    duration_unit: str | None = None,
+    feature_columns: Sequence[str] | None = None,
     min_gap_seconds: float = 0.0,
     preprocessor_method: str = "standard",
+    impute_strategy: str = "median",
     scaler_save_path: str | Path = "artifacts/scaler.pkl",
+    enforce_provenance: bool = True,
+    provenance: DatasetProvenance | dict[str, Any] | str | Path | None = None,
+    acknowledge_zero_duration: bool = False,
+    allow_unknown_labels: bool = False,
 ) -> ResearchPipelineData:
     """Production research pipeline: zero data leakage, chronological-first partitioning,
 
-    training-only scaler fitting, and partition-isolated temporal window generation.
+    training-only scaler fitting, training-only imputation, and partition-isolated temporal window generation.
 
     Execution Flow:
-        1. Ingest and validate DataFrame.
-        2. Enforce 20-feature dataset contract.
+        1. Ingest and validate DataFrame (verifying provenance if enforce_provenance=True).
+        2. Enforce 20-feature dataset contract and configure dataset-specific temporal parameters.
         3. Split chronologically into Train, Validation, and Test partitions first.
-        4. Fit NetworkDataPreprocessor strictly on Training features only.
+        4. Fit NetworkDataPreprocessor strictly on Training features only (including imputation).
         5. Transform Validation and Test features out-of-sample using the fitted preprocessor.
-        6. Construct sliding windows independently within each partition boundary.
-        7. Audit and verify temporal isolation before returning.
+        6. Validate target labels (fail closed on missing, null, or invalid labels).
+        7. Construct sliding windows independently within each partition boundary.
+        8. Audit and verify temporal isolation before returning.
 
     Raises:
-        ValueError: If timestamps or durations are invalid or temporal isolation fails.
+        ValueError: If timestamps, durations, labels, provenance, or temporal isolation fails.
     """
-    # 1. Ingest dataset
+    # 1. Ingest dataset and verify provenance
     if isinstance(data_or_path, (str, Path)):
-        df = load_dataset(data_or_path, dataset_name=dataset_name)
+        df = load_dataset(
+            data_or_path,
+            dataset_name=dataset_name,
+            enforce_provenance=enforce_provenance,
+            provenance=provenance,
+            is_research=enforce_provenance,
+            strict_timestamps=True,
+        )
     else:
         df = data_or_path.copy()
+        if enforce_provenance:
+            prov_obj = provenance if provenance is not None else df.attrs.get("provenance")
+            if prov_obj is None:
+                raise ValueError(
+                    "Research pipeline requires explicit dataset provenance. Pass a verified "
+                    "DatasetProvenance record or set enforce_provenance=False for synthetic unit tests."
+                )
+            if isinstance(prov_obj, dict):
+                prov_obj = DatasetProvenance.from_dict(prov_obj)
+            if not getattr(prov_obj, "is_research_evidence", False) or getattr(prov_obj, "provenance_type", "") != "official_research":
+                raise ValueError(
+                    f"Dataset has provenance_type='{getattr(prov_obj, 'provenance_type', 'unknown')}' "
+                    f"(is_research_evidence=False) and is strictly rejected for empirical research "
+                    f"under SIH 26153 rules. Synthetic demonstration data cannot be used as research evidence."
+                )
 
     if df.empty:
         raise ValueError("Cannot prepare research pipeline on an empty DataFrame.")
 
     # 2. Validate feature schema
-    feature_cols = get_feature_columns(dataset_name)
+    feature_cols = list(feature_columns) if feature_columns else get_feature_columns(dataset_name)
     validate_required_columns(df, feature_cols)
 
-    # Auto-detect default duration columns if present
+    # Resolve dataset-specific temporal configurations
+    ts_col = timestamp_col
     dur_col = duration_col
+    dur_unit = duration_unit
+
+    if dataset_name in DATASET_SPECS:
+        spec = DATASET_SPECS[dataset_name]
+        if ts_col is None and spec.get("timestamp_col") in df.columns:
+            ts_col = spec.get("timestamp_col")
+        if dur_col is None and spec.get("duration_col") in df.columns:
+            dur_col = spec.get("duration_col")
+            if dur_unit is None:
+                dur_unit = spec.get("duration_unit")
+        elif dur_unit is None:
+            dur_unit = spec.get("duration_unit")
+
+    # Fallback to column discovery if not specified
+    if ts_col is None:
+        for cand in ["datetime", "timestamp", "stime"]:
+            if cand in df.columns:
+                ts_col = cand
+                break
+
     if dur_col is None:
-        if "dur" in df.columns:
-            dur_col = "dur"
-            duration_unit = "s"
-        elif "flow_duration" in df.columns:
-            dur_col = "flow_duration"
-            duration_unit = "us"
+        for cand, default_u in [("dur", "s"), ("flow_duration", "us")]:
+            if cand in df.columns:
+                dur_col = cand
+                if dur_unit is None:
+                    dur_unit = default_u
+                break
+
+    if dur_unit is None:
+        dur_unit = "s"
+
+    if dur_col is None and not acknowledge_zero_duration:
+        raise ValueError(
+            f"No duration column found or specified for dataset '{dataset_name}'. In strict "
+            f"research mode, flows cannot be assumed instantaneous (0-duration) without "
+            f"explicit user acknowledgment. Pass duration_col or acknowledge_zero_duration=True."
+        )
 
     # 3. Chronological partitioning FIRST
     train_df, val_df, test_df = chronological_split(
         df,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
-        timestamp_col=timestamp_col,
+        timestamp_col=ts_col,
         duration_col=dur_col,
-        duration_unit=duration_unit,
+        duration_unit=dur_unit,
         min_gap_seconds=min_gap_seconds,
         allow_index_fallback=False,  # Strictly forbidden for research
     )
 
-    # 4. Feature extraction per partition
+    # 4. Feature extraction per partition & training-only imputation
     train_feat = extract_features(train_df, dataset_name=dataset_name, feature_columns=feature_cols)
-    val_feat = extract_features(val_df, dataset_name=dataset_name, feature_columns=feature_cols)
-    test_feat = extract_features(test_df, dataset_name=dataset_name, feature_columns=feature_cols)
 
     # 5. Preprocessor fitted ONLY on training partition
-    preprocessor = NetworkDataPreprocessor(method=preprocessor_method, feature_columns=feature_cols)
+    preprocessor = NetworkDataPreprocessor(
+        method=preprocessor_method,
+        feature_columns=feature_cols,
+        impute_strategy=impute_strategy,
+    )
     scaled_train = preprocessor.fit_transform(train_feat)
     preprocessor.save(scaler_save_path)
 
-    # 6. Transform validation and test out-of-sample
+    # 6. Transform validation and test out-of-sample using training imputation & scaling
+    train_impute_vals = preprocessor.impute_values_
+    val_feat = extract_features(
+        val_df,
+        dataset_name=dataset_name,
+        feature_columns=feature_cols,
+        impute_values=train_impute_vals,
+    )
+    test_feat = extract_features(
+        test_df,
+        dataset_name=dataset_name,
+        feature_columns=feature_cols,
+        impute_values=train_impute_vals,
+    )
     scaled_val = preprocessor.transform(val_feat)
     scaled_test = preprocessor.transform(test_feat)
 
-    # Extract labels
-    y_att_train, y_stg_train = _extract_partition_targets(train_df, dataset_name)
-    y_att_val, y_stg_val = _extract_partition_targets(val_df, dataset_name)
-    y_att_test, y_stg_test = _extract_partition_targets(test_df, dataset_name)
+    # 7. Extract labels with fail-closed validation
+    y_att_train, y_stg_train = _extract_partition_targets(
+        train_df, dataset_name, strict_labels=True, allow_unknown_labels=allow_unknown_labels
+    )
+    y_att_val, y_stg_val = _extract_partition_targets(
+        val_df, dataset_name, strict_labels=True, allow_unknown_labels=allow_unknown_labels
+    )
+    y_att_test, y_stg_test = _extract_partition_targets(
+        test_df, dataset_name, strict_labels=True, allow_unknown_labels=allow_unknown_labels
+    )
 
     # Identify timestamp array for interval audits
-    ts_col = timestamp_col or ("datetime" if "datetime" in df.columns else None)
-    train_ts = train_df[ts_col].to_numpy() if ts_col and ts_col in train_df.columns else None
-    val_ts = val_df[ts_col].to_numpy() if ts_col and ts_col in val_df.columns else None
-    test_ts = test_df[ts_col].to_numpy() if ts_col and ts_col in test_df.columns else None
+    active_ts = ts_col or ("datetime" if "datetime" in df.columns else None)
+    train_ts = train_df[active_ts].to_numpy() if active_ts and active_ts in train_df.columns else None
+    val_ts = val_df[active_ts].to_numpy() if active_ts and active_ts in val_df.columns else None
+    test_ts = test_df[active_ts].to_numpy() if active_ts and active_ts in test_df.columns else None
 
-    # 7. Partition-isolated window generation
+    # 8. Partition-isolated window generation
     X_train_w, y_prob_train_w, y_stg_train_w, int_train = create_network_windows(
         scaled_train, y_att_train, y_stg_train, timestamps=train_ts, return_intervals=True
     )
@@ -285,16 +457,16 @@ def prepare_research_pipeline(
 
     # Isolation audit
     isolation_audit: dict[str, Any] = {}
-    if ts_col and ts_col in df.columns:
+    if active_ts and active_ts in df.columns:
         from src.pipeline.windowing import verify_temporal_isolation
 
         isolation_audit = verify_temporal_isolation(
             train_df,
             val_df,
             test_df,
-            timestamp_col=ts_col,
+            timestamp_col=active_ts,
             duration_col=dur_col,
-            duration_unit=duration_unit,
+            duration_unit=dur_unit,
         )
 
     return ResearchPipelineData(

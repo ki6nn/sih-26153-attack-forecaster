@@ -113,7 +113,36 @@ print(f"Missing / Infinite Features: {report['columns_with_missing_or_inf']}")
 
 ---
 
-## 6. Data Tier Definitions Summary
+## 6. Research Governance Policies (Phase 1.6 Hardening)
+
+### 6.1 Cryptographic Provenance & Evidence Verification
+- **Strict Provenance Requirement:** In research mode (`is_research=True` or `enforce_provenance=True`), the pipeline requires a registered `DatasetProvenance` record.
+- **Cryptographic Checksum Verification:** When `sha256` is provided, the actual SHA-256 hash of the ingested file is computed and compared against the registered hash. Tampered, incomplete, or corrupted downloads are rejected.
+- **Verification vs. User Attribution:** The pipeline cryptographically verifies file integrity and hash equivalence against the provenance record. Origin URLs and author citations remain user-supplied metadata from the dataset publishers.
+- **Rejection of Synthetic Demonstrations:** Datasets flagged with `is_research_evidence: false` or `provenance_type: "synthetic_demonstration_data"` (e.g. `data/sample_demo.csv`) are rejected with `ValueError` when entering research pipelines.
+
+### 6.2 Fail-Closed Target Label Policy
+- **Mandatory Labels:** Every partition must contain a ground truth label column (`attack_cat` or `label`). If missing, the pipeline raises a descriptive `ValueError`.
+- **Zero Null Imputation:** Null, empty string, or NaN labels raise `ValueError`. The pipeline never silently imputes missing labels as benign (`Normal`).
+- **Binary vs. Tactical Categorization:**
+  * Binary classification evaluates whether network traffic is benign ($0$) or attack ($1$).
+  * Multiclass MITRE stage mapping is a high-level heuristic categorization into coarse tactical phases (Reconnaissance, Exploits, DoS, etc.) for sequence forecasting. It **does NOT establish verified MITRE ATT&CK enterprise technique attributions**.
+  * Unknown categories map to `Generic` (attack stage with $y_{\text{attack}} = 1$) or raise `ValueError` in strict mode; unknown labels are **NEVER mapped to Normal**.
+
+### 6.3 Explicit Feature Validation & Training-Only Imputation
+- **Anomaly Detection:** Features are scanned for NaNs, $+ \infty$, $-\infty$, and non-numeric values via `detect_feature_anomalies()`.
+- **Training-Only Fitting:** Imputation values (`impute_values_`) are fitted exclusively on the training partition (using finite medians).
+- **Out-of-Sample Transformation:** Validation and test partitions are transformed using the pre-fitted training imputation statistics. Validation/test values cannot mutate training statistics.
+- **Preservation of Legitimate Zeros:** Valid numeric $0.0$ network values (e.g. zero packet loss, zero TCP flags) are preserved untouched.
+
+### 6.4 Timestamp and Duration Policies
+- **Explicit Dataset Specifications:** `unsw_nb15` uses `stime` (epoch seconds) and `dur` (seconds). `cic_ids2017` uses `timestamp` (string) and `flow_duration` ($\mu\text{s}$, converted to seconds by dividing by $10^6$).
+- **Strict Timestamp Parsing:** In research mode, any unparseable timestamp or null record fails immediately with `ValueError`.
+- **Duration Acknowledgment:** Datasets lacking duration columns cannot be assumed instantaneous (0-duration) in research mode without explicit user acknowledgment (`acknowledge_zero_duration=True`).
+
+---
+
+## 7. Data Tier Definitions Summary
 
 | Data Tier | Location | Source | Permitted Usage |
 | :--- | :--- | :--- | :--- |
