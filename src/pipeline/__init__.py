@@ -5,6 +5,7 @@ from src.pipeline.features import (
     UNSW_NB15_FEATURES,
     encode_categorical_features,
     extract_features,
+    get_feature_columns,
     map_stage_labels,
 )
 from src.pipeline.ingestion import (
@@ -14,7 +15,12 @@ from src.pipeline.ingestion import (
     parse_timestamps,
     record_source_provenance,
 )
-from src.pipeline.preprocessor import NetworkDataPreprocessor, preprocess
+from src.pipeline.preprocessor import (
+    NetworkDataPreprocessor,
+    ResearchPipelineData,
+    prepare_research_pipeline,
+    preprocess,
+)
 from src.pipeline.validation import (
     clean_missing_and_infinite,
     detect_duplicate_records,
@@ -26,6 +32,8 @@ from src.pipeline.validation import (
 from src.pipeline.windowing import (
     chronological_split,
     create_network_windows,
+    validate_and_extract_durations,
+    verify_temporal_isolation,
 )
 
 __all__ = [
@@ -42,11 +50,16 @@ __all__ = [
     "generate_data_quality_report",
     "CICIDS2017_FEATURES",
     "UNSW_NB15_FEATURES",
+    "get_feature_columns",
     "extract_features",
     "map_stage_labels",
     "encode_categorical_features",
     "NetworkDataPreprocessor",
+    "ResearchPipelineData",
+    "prepare_research_pipeline",
     "preprocess",
     "chronological_split",
     "create_network_windows",
+    "validate_and_extract_durations",
+    "verify_temporal_isolation",
 ]

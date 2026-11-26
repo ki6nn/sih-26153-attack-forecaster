@@ -10,6 +10,77 @@ import pandas as pd
 from src.contracts import FORECAST_STEPS, WINDOW_SIZE
 
 
+def validate_and_extract_durations(
+    df: pd.DataFrame,
+    duration_col: str | None,
+    duration_unit: str = "s",
+) -> pd.Series | None:
+    """Validate and extract network flow active durations in seconds.
+
+    Strict Requirements:
+        - If duration_col is supplied, it must exist in df.
+        - Non-numeric, NaN, infinite, or negative durations raise ValueError.
+        - duration_unit must be strictly 's' (seconds) or 'us' (microseconds).
+        - If duration_col is None, returns None (flow is treated as instantaneous event).
+
+    Args:
+        df: Input DataFrame.
+        duration_col: Column name containing flow duration.
+        duration_unit: 's' for seconds (UNSW-NB15) or 'us' for microseconds (CIC-IDS2017).
+
+    Returns:
+        pd.Series of duration in seconds (float64), or None if duration_col is None.
+
+    Raises:
+        ValueError: If duration_col is missing, unit is unsupported, or values are invalid.
+    """
+    if duration_col is None:
+        return None
+
+    if duration_col not in df.columns:
+        raise ValueError(
+            f"Specified duration column '{duration_col}' was not found in DataFrame. "
+            f"Present columns: {list(df.columns[:10])}..."
+        )
+
+    unit = str(duration_unit).strip().lower()
+    if unit not in {"s", "us"}:
+        raise ValueError(
+            f"Unsupported duration_unit '{duration_unit}'. Supported units are strictly "
+            f"'s' (seconds) and 'us' (microseconds). Do not assume implicit units."
+        )
+
+    raw_durations = df[duration_col]
+    if raw_durations.isna().any():
+        nan_count = int(raw_durations.isna().sum())
+        raise ValueError(
+            f"Duration column '{duration_col}' contains {nan_count} NaN/null values. "
+            f"Durations must be valid finite numbers."
+        )
+
+    try:
+        numeric_durations = pd.to_numeric(raw_durations, errors="raise")
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Duration column '{duration_col}' contains non-numeric values: {exc}"
+        ) from exc
+
+    if np.isinf(numeric_durations).any():
+        raise ValueError(f"Duration column '{duration_col}' contains infinite values.")
+
+    if (numeric_durations < 0).any():
+        neg_count = int((numeric_durations < 0).sum())
+        raise ValueError(
+            f"Duration column '{duration_col}' contains {neg_count} negative duration values. "
+            f"Durations must be non-negative."
+        )
+
+    if unit == "us":
+        # Convert microseconds to seconds
+        return numeric_durations.astype(np.float64) / 1e6
+    return numeric_durations.astype(np.float64)
+
+
 def verify_temporal_isolation(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -48,16 +119,11 @@ def verify_temporal_isolation(
 
     def _compute_flow_end_times(part: pd.DataFrame) -> pd.Series:
         start_ts = part[timestamp_col]
-        if duration_col and duration_col in part.columns:
-            durations = pd.to_numeric(part[duration_col], errors="coerce").fillna(0.0)
-            if duration_unit.lower() in {"us", "microsecond", "microseconds"}:
-                if pd.api.types.is_datetime64_any_dtype(start_ts):
-                    return start_ts + pd.to_timedelta(durations, unit="us")
-                return start_ts + (durations / 1e6)
-            # Default seconds
+        dur_sec = validate_and_extract_durations(part, duration_col=duration_col, duration_unit=duration_unit)
+        if dur_sec is not None:
             if pd.api.types.is_datetime64_any_dtype(start_ts):
-                return start_ts + pd.to_timedelta(durations, unit="s")
-            return start_ts + durations
+                return start_ts + pd.to_timedelta(dur_sec, unit="s")
+            return start_ts + dur_sec
         return start_ts
 
     train_end_time = _compute_flow_end_times(train_df).max()
@@ -198,18 +264,12 @@ def chronological_split(
 
     # 3. Compute flow completion times accounting for duration
     start_ts = df[ts_col]
-    if duration_col and duration_col in df.columns:
-        durations = pd.to_numeric(df[duration_col], errors="coerce").fillna(0.0)
-        if duration_unit.lower() in {"us", "microsecond", "microseconds"}:
-            if pd.api.types.is_datetime64_any_dtype(start_ts):
-                end_ts = start_ts + pd.to_timedelta(durations, unit="us")
-            else:
-                end_ts = start_ts + (durations / 1e6)
+    dur_sec = validate_and_extract_durations(df, duration_col=duration_col, duration_unit=duration_unit)
+    if dur_sec is not None:
+        if pd.api.types.is_datetime64_any_dtype(start_ts):
+            end_ts = start_ts + pd.to_timedelta(dur_sec, unit="s")
         else:
-            if pd.api.types.is_datetime64_any_dtype(start_ts):
-                end_ts = start_ts + pd.to_timedelta(durations, unit="s")
-            else:
-                end_ts = start_ts + durations
+            end_ts = start_ts + dur_sec
     else:
         end_ts = start_ts
 
@@ -263,7 +323,6 @@ def chronological_split(
     # Find validation end boundary
     target_val_idx = max(val_start_idx + min_rows_per_split, int(total_len * (train_ratio + val_ratio)))
     if target_val_idx >= total_len - min_rows_per_split:
-        # Adjust target_val_idx to fit between val_start_idx and test
         target_val_idx = val_start_idx + min_rows_per_split
 
     if target_val_idx >= total_len:

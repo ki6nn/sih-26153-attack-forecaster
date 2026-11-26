@@ -37,12 +37,21 @@ def parse_timestamps(
     df: pd.DataFrame,
     timestamp_col: str | None = None,
     sort_chronological: bool = True,
+    strict: bool = False,
 ) -> pd.DataFrame:
-    """Identify and parse timestamp column into standardized UTC datetimes.
+    """Identify and parse timestamp column into standardized UTC datetimes while preserving original raw values.
 
-    Supports:
-        - ISO datetime strings (e.g. '2017-07-07 09:30:00' or '07/07/2017 09:30:00')
-        - Epoch unix timestamps in seconds or milliseconds (e.g. UNSW-NB15 stime/ltime)
+    Distinguishes:
+        - ISO datetime strings (e.g. CIC-IDS2017 '07/07/2017 08:30:00' or ISO-8601)
+        - Numeric epoch timestamps in seconds (UNSW-NB15 stime/ltime ~ 1.42e9)
+        - Numeric epoch timestamps in milliseconds (~ 1.42e12)
+        - Relative seconds from start of capture (< 1e8)
+
+    Preserves the original source column untouched and adds 'datetime' column.
+    Uses stable sorting so identical timestamp groups preserve original arrival order.
+
+    Raises:
+        ValueError: If strict=True and timestamp parsing produces NaT/null values.
     """
     result = df.copy()
     candidate_cols = (
@@ -60,31 +69,49 @@ def parse_timestamps(
     if detected_col is None:
         return result
 
-    sample = result[detected_col].dropna().iloc[:10] if len(result[detected_col].dropna()) > 0 else []
+    raw_series = result[detected_col]
+    non_null_samples = raw_series.dropna()
+    if len(non_null_samples) == 0:
+        result["datetime"] = pd.Series([pd.NaT] * len(result), dtype="datetime64[ns, UTC]")
+        if strict:
+            raise ValueError(f"Timestamp column '{detected_col}' contains only null values.")
+        return result
+
     is_numeric = False
     try:
-        pd.to_numeric(sample)
+        pd.to_numeric(non_null_samples.iloc[:20])
         is_numeric = True
     except (ValueError, TypeError):
         is_numeric = False
 
     if is_numeric:
-        raw_numeric = pd.to_numeric(result[detected_col], errors="coerce")
-        median_val = raw_numeric.median() if len(raw_numeric.dropna()) > 0 else 0
+        raw_numeric = pd.to_numeric(raw_series, errors="coerce")
+        median_val = float(raw_numeric.dropna().median()) if len(raw_numeric.dropna()) > 0 else 0.0
+        # Distinguish millisecond epochs from second epochs
         if median_val > 1e11:
             unit = "ms"
         elif median_val > 1e8:
             unit = "s"
         else:
+            # Relative flow seconds starting from zero: anchor to arbitrary base epoch
             unit = "s"
         result["datetime"] = pd.to_datetime(raw_numeric, unit=unit, utc=True, errors="coerce")
     else:
+        # String timestamps (e.g. CIC-IDS2017 '07/07/2017 09:30:00')
         result["datetime"] = pd.to_datetime(
-            result[detected_col], utc=True, errors="coerce", format="mixed"
+            raw_series, utc=True, errors="coerce", format="mixed"
         )
 
-    if sort_chronological and "datetime" in result.columns and not result["datetime"].isna().all():
-        result = result.sort_values(by="datetime", ascending=True).reset_index(drop=True)
+    nat_count = int(result["datetime"].isna().sum())
+    if strict and nat_count > int(raw_series.isna().sum()):
+        raise ValueError(
+            f"Timestamp parsing failed for {nat_count - int(raw_series.isna().sum())} records "
+            f"in column '{detected_col}'."
+        )
+
+    if sort_chronological and not result["datetime"].isna().all():
+        # Stable sort preserves identical timestamp groupings in original relative order
+        result = result.sort_values(by="datetime", ascending=True, kind="stable").reset_index(drop=True)
 
     return result
 
@@ -94,7 +121,7 @@ def record_source_provenance(
     dataset_name: str,
     filepath: str | Path,
 ) -> pd.DataFrame:
-    """Attach dataset origin and file provenance to the dataframe."""
+    """Attach dataset origin and file provenance metadata to the dataframe."""
     result = df.copy()
     result["_source_dataset"] = str(dataset_name)
     result["_source_file"] = Path(filepath).name
@@ -131,11 +158,12 @@ def load_dataset(
     chunksize: int = 50000,
     nrows: int | None = None,
     timestamp_col: str | None = None,
+    strict_timestamps: bool = False,
 ) -> pd.DataFrame:
     """High-level loader for network traffic datasets.
 
-    Loads CSV in chunks, standardizes columns, parses timestamps, adds provenance,
-    and returns a consolidated, chronologically sorted DataFrame.
+    Loads CSV in chunks, standardizes column headers, parses timestamps with stable sorting,
+    records source provenance, and returns a consolidated DataFrame.
     """
     path = Path(filepath)
     if not path.exists():
@@ -158,6 +186,11 @@ def load_dataset(
         return pd.DataFrame()
 
     combined = pd.concat(chunks, ignore_index=True)
-    combined = parse_timestamps(combined, timestamp_col=timestamp_col, sort_chronological=True)
+    combined = parse_timestamps(
+        combined,
+        timestamp_col=timestamp_col,
+        sort_chronological=True,
+        strict=strict_timestamps,
+    )
     combined = record_source_provenance(combined, dataset_name=dataset_name, filepath=path)
     return combined
