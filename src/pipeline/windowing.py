@@ -400,7 +400,8 @@ def create_network_windows(
     window_size: int = WINDOW_SIZE,
     forecast_steps: int = FORECAST_STEPS,
     return_intervals: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+    return_future_states: bool = False,
+) -> tuple[Any, ...]:
     """Construct sliding feature windows and multi-step future targets strictly within a partition.
 
     Explicit interval definition:
@@ -412,18 +413,19 @@ def create_network_windows(
     Args:
         X: Feature matrix of shape (N, D).
         y_attack: Binary attack labels of shape (N,). 1 if attack, 0 if benign.
-        y_stage: Optional integer MITRE stage labels of shape (N,).
+        y_stage: Optional integer category labels of shape (N,).
         timestamps: Optional timestamps of shape (N,) for tracking temporal intervals.
         window_size: Past lookback timesteps (W=10).
         forecast_steps: Future prediction horizon (H=4).
         return_intervals: If True, returns an interval audit DataFrame.
+        return_future_states: If True, returns future feature states X_future of shape (M, H, D)
+            and aligned multi-horizon category targets of shape (M, H).
 
     Returns:
-        Tuple of:
-            - X_windows: (M, W, D) float32 sliding feature history.
-            - y_future_attack: (M, H) float32 multi-step future binary labels.
-            - y_next_stage: (M,) int64 immediate next-step stage label.
-            - (Optional) interval_df: Metadata DataFrame with exact start/end indices and timestamps.
+        If return_future_states=True:
+            (X_windows, X_future, y_future_attack, y_future_stage [, interval_df])
+        If return_future_states=False (legacy parity):
+            (X_windows, y_future_attack, y_next_stage [, interval_df])
 
     Raises:
         ValueError: If input sample count is less than (window_size + forecast_steps).
@@ -461,34 +463,58 @@ def create_network_windows(
     )
     y_next_stage = y_stg_arr[window_size : window_size + valid_windows]
 
-    if not return_intervals:
-        return X_windows.astype(np.float32), y_future_attack.astype(np.float32), y_next_stage.astype(np.int64)
+    X_future = np.stack([X_arr[i + window_size : i + total_horizon] for i in range(valid_windows)])
+    y_future_stage = np.stack([y_stg_arr[i + window_size : i + total_horizon] for i in range(valid_windows)])
 
     ts_arr = np.asarray(timestamps) if timestamps is not None else None
-    records = []
-    for i in range(valid_windows):
-        input_start = i
-        input_end = i + window_size - 1
-        target_start = i + window_size
-        target_end = i + total_horizon - 1
-        rec: dict[str, Any] = {
-            "window_id": i,
-            "input_start_idx": input_start,
-            "input_end_idx": input_end,
-            "target_start_idx": target_start,
-            "target_end_idx": target_end,
-        }
-        if ts_arr is not None:
-            rec["input_start_time"] = ts_arr[input_start]
-            rec["input_end_time"] = ts_arr[input_end]
-            rec["target_start_time"] = ts_arr[target_start]
-            rec["target_end_time"] = ts_arr[target_end]
-        records.append(rec)
+    interval_df = None
+    if return_intervals:
+        records = []
+        for i in range(valid_windows):
+            input_start = i
+            input_end = i + window_size - 1
+            target_start = i + window_size
+            target_end = i + total_horizon - 1
+            rec: dict[str, Any] = {
+                "window_id": i,
+                "input_start_idx": input_start,
+                "input_end_idx": input_end,
+                "target_start_idx": target_start,
+                "target_end_idx": target_end,
+            }
+            if ts_arr is not None:
+                rec["input_start_time"] = ts_arr[input_start]
+                rec["input_end_time"] = ts_arr[input_end]
+                rec["target_start_time"] = ts_arr[target_start]
+                rec["target_end_time"] = ts_arr[target_end]
+            records.append(rec)
+        interval_df = pd.DataFrame.from_records(records)
 
-    interval_df = pd.DataFrame.from_records(records)
+    if return_future_states:
+        if return_intervals:
+            return (
+                X_windows.astype(np.float32),
+                X_future.astype(np.float32),
+                y_future_attack.astype(np.float32),
+                y_future_stage.astype(np.int64),
+                interval_df,
+            )
+        return (
+            X_windows.astype(np.float32),
+            X_future.astype(np.float32),
+            y_future_attack.astype(np.float32),
+            y_future_stage.astype(np.int64),
+        )
+
+    if return_intervals:
+        return (
+            X_windows.astype(np.float32),
+            y_future_attack.astype(np.float32),
+            y_next_stage.astype(np.int64),
+            interval_df,
+        )
     return (
         X_windows.astype(np.float32),
         y_future_attack.astype(np.float32),
         y_next_stage.astype(np.int64),
-        interval_df,
     )

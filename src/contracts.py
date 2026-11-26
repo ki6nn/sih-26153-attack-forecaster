@@ -1,11 +1,33 @@
 from dataclasses import asdict, dataclass
+from typing import Final
 
 
-WINDOW_SIZE = 10
-FORECAST_STEPS = 4
-NUM_FEATURES = 20
+WINDOW_SIZE: Final[int] = 10
+FORECAST_STEPS: Final[int] = 4
+NUM_FEATURES: Final[int] = 20
+FEATURE_DIM: Final[int] = NUM_FEATURES
 
+# Explicit dataset-derived attack category groups.
+# NOTE: These groups represent heuristic operational categories derived from raw dataset
+# attack classes (e.g. UNSW-NB15 attack_cat and CIC-IDS2017 label). They are NOT verified
+# MITRE ATT&CK enterprise technique attributions.
+ATTACK_CATEGORY_GROUPS: Final[list[str]] = [
+    "Normal",          # Index 0: Benign / Normal background traffic
+    "Reconnaissance",  # Index 1: PortScan, Network Probes
+    "Analysis",        # Index 2: Bot, Security Scans
+    "Fuzzers",         # Index 3: Protocol/Format fuzzing
+    "Exploits",        # Index 4: Web exploits, Brute Force
+    "DoS",             # Index 5: Denial of Service, DDoS
+    "Generic",         # Index 6: Generic/unclassified attacks, Patator
+    "Shellcode",       # Index 7: Buffer/stack payload execution
+    "Backdoor",        # Index 8: Infiltration, C2/backdoors
+    "Worms",           # Index 9: Self-propagating malware
+]
 
+NUM_ATTACK_CATEGORIES: Final[int] = len(ATTACK_CATEGORY_GROUPS)
+IGNORE_CATEGORY_INDEX: Final[int] = -100  # Mask index for unmapped or missing categorical labels
+
+# Legacy alias for backward compatibility with existing tests
 MITRE_STAGE_MAP: dict[str, dict[str, str]] = {
     "Normal": {
         "tactic": "None",

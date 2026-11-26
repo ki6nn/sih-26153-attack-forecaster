@@ -11,8 +11,11 @@ import numpy as np
 import pandas as pd
 
 from src.contracts import (
+    ATTACK_CATEGORY_GROUPS,
     FORECAST_STEPS,
+    IGNORE_CATEGORY_INDEX,
     MITRE_STAGE_MAP,
+    NUM_ATTACK_CATEGORIES,
     NUM_FEATURES,
     WINDOW_SIZE,
 )
@@ -54,6 +57,12 @@ class ResearchPipelineData:
     intervals_train: pd.DataFrame
     intervals_val: pd.DataFrame
     intervals_test: pd.DataFrame
+    X_target_train: np.ndarray | None = None
+    X_target_val: np.ndarray | None = None
+    X_target_test: np.ndarray | None = None
+    y_category_train: np.ndarray | None = None
+    y_category_val: np.ndarray | None = None
+    y_category_test: np.ndarray | None = None
 
 
 class NetworkDataPreprocessor:
@@ -445,14 +454,14 @@ def prepare_research_pipeline(
     test_ts = test_df[active_ts].to_numpy() if active_ts and active_ts in test_df.columns else None
 
     # 8. Partition-isolated window generation
-    X_train_w, y_prob_train_w, y_stg_train_w, int_train = create_network_windows(
-        scaled_train, y_att_train, y_stg_train, timestamps=train_ts, return_intervals=True
+    X_train_w, X_tgt_train, y_prob_train_w, y_cat_train_w, int_train = create_network_windows(
+        scaled_train, y_att_train, y_stg_train, timestamps=train_ts, return_intervals=True, return_future_states=True
     )
-    X_val_w, y_prob_val_w, y_stg_val_w, int_val = create_network_windows(
-        scaled_val, y_att_val, y_stg_val, timestamps=val_ts, return_intervals=True
+    X_val_w, X_tgt_val, y_prob_val_w, y_cat_val_w, int_val = create_network_windows(
+        scaled_val, y_att_val, y_stg_val, timestamps=val_ts, return_intervals=True, return_future_states=True
     )
-    X_test_w, y_prob_test_w, y_stg_test_w, int_test = create_network_windows(
-        scaled_test, y_att_test, y_stg_test, timestamps=test_ts, return_intervals=True
+    X_test_w, X_tgt_test, y_prob_test_w, y_cat_test_w, int_test = create_network_windows(
+        scaled_test, y_att_test, y_stg_test, timestamps=test_ts, return_intervals=True, return_future_states=True
     )
 
     # Isolation audit
@@ -472,19 +481,25 @@ def prepare_research_pipeline(
     return ResearchPipelineData(
         X_train=X_train_w,
         y_probs_train=y_prob_train_w,
-        y_stage_train=y_stg_train_w,
+        y_stage_train=y_cat_train_w,
         X_val=X_val_w,
         y_probs_val=y_prob_val_w,
-        y_stage_val=y_stg_val_w,
+        y_stage_val=y_cat_val_w,
         X_test=X_test_w,
         y_probs_test=y_prob_test_w,
-        y_stage_test=y_stg_test_w,
+        y_stage_test=y_cat_test_w,
         preprocessor=preprocessor,
         feature_names=feature_cols,
         isolation_audit=isolation_audit,
         intervals_train=int_train,
         intervals_val=int_val,
         intervals_test=int_test,
+        X_target_train=X_tgt_train,
+        X_target_val=X_tgt_val,
+        X_target_test=X_tgt_test,
+        y_category_train=y_cat_train_w,
+        y_category_val=y_cat_val_w,
+        y_category_test=y_cat_test_w,
     )
 
 
