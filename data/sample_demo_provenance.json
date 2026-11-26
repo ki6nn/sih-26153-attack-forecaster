@@ -1,0 +1,12 @@
+{
+  "file": "data/sample_demo.csv",
+  "sha256": "069a7866c467a8199016cdd288d87dd6bc0328c2e083710a5f98e8b584caa17a",
+  "provenance_type": "synthetic_demonstration_data",
+  "dataset_version": "N/A (Synthetic in-repo generator)",
+  "source": "Generated via src.pipeline.preprocessor._synthetic_dataset (commit 8eb9f81)",
+  "extraction_procedure": "Generated using np.random.default_rng(42) across 5 stages (Normal, Reconnaissance, Exploits, Backdoor, DoS) with 100 rows per stage, producing 20 numeric flow columns without timestamps.",
+  "rows": 500,
+  "columns": 21,
+  "is_research_evidence": false,
+  "usage_restriction": "For offline SOC dashboard UI demonstration and smoke testing only. Strictly prohibited from being used as empirical research evidence or benchmark metrics under SIH 26153 rules."
+}

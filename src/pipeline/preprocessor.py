@@ -1,14 +1,13 @@
-"""Prepare UNSW-NB15 flows for the attack forecaster."""
+"""Training-only preprocessing module with strict isolation and artifact serialization."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import Final, Sequence
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
 
 from src.contracts import (
     FORECAST_STEPS,
@@ -16,159 +15,183 @@ from src.contracts import (
     NUM_FEATURES,
     WINDOW_SIZE,
 )
-
-
-FEATURE_COLUMNS: Final[list[str]] = [
-    "dur",
-    "spkts",
-    "dpkts",
-    "sbytes",
-    "dbytes",
-    "rate",
-    "sttl",
-    "dttl",
-    "sload",
-    "dload",
-    "sloss",
-    "dloss",
-    "sinpkt",
-    "dinpkt",
-    "sjit",
-    "djit",
-    "swin",
-    "dwin",
-    "ct_state_ttl",
-    "ct_srv_src",
-]
-
-_STAGES: Final[list[str]] = [
-    "Normal",
-    "Reconnaissance",
-    "Exploits",
-    "Backdoor",
-    "DoS",
-]
-_DATA_FILES: Final[tuple[Path, Path]] = (
-    Path("data/UNSW_NB15_training-set.csv"),
-    Path("data/UNSW_NB15_testing-set.csv"),
+from src.pipeline.features import (
+    UNSW_NB15_FEATURES,
+    extract_features,
+    map_stage_labels,
 )
 
-
-def _synthetic_dataset(rows_per_stage: int = 120) -> pd.DataFrame:
-    """Create deterministic, stage-shaped flows when the downloaded data is absent."""
-    rng = np.random.default_rng(42)
-    records: list[dict[str, object]] = []
-    for stage_index, stage in enumerate(_STAGES):
-        for _ in range(rows_per_stage):
-            intensity = float(stage_index)
-            values = {
-                "dur": max(0.001, rng.lognormal(-1.0 + intensity * 0.18, 0.35)),
-                "spkts": max(1.0, rng.poisson(8 + intensity * 10)),
-                "dpkts": max(1.0, rng.poisson(7 + intensity * 8)),
-                "sbytes": max(40.0, rng.lognormal(7.0 + intensity * 0.35, 0.45)),
-                "dbytes": max(40.0, rng.lognormal(7.1 + intensity * 0.3, 0.45)),
-                "rate": max(0.1, rng.lognormal(3.0 + intensity * 0.55, 0.35)),
-                "sttl": np.clip(rng.normal(120 - intensity * 8, 10), 1, 255),
-                "dttl": np.clip(rng.normal(115 - intensity * 7, 10), 1, 255),
-                "sload": max(1.0, rng.lognormal(8.0 + intensity * 0.45, 0.4)),
-                "dload": max(1.0, rng.lognormal(7.8 + intensity * 0.4, 0.4)),
-                "sloss": max(0.0, rng.poisson(intensity * 1.5)),
-                "dloss": max(0.0, rng.poisson(intensity * 1.2)),
-                "sinpkt": max(0.01, rng.lognormal(2.0 - intensity * 0.18, 0.3)),
-                "dinpkt": max(0.01, rng.lognormal(2.1 - intensity * 0.16, 0.3)),
-                "sjit": max(0.0, rng.lognormal(-0.2 + intensity * 0.2, 0.35)),
-                "djit": max(0.0, rng.lognormal(-0.25 + intensity * 0.2, 0.35)),
-                "swin": max(0.0, rng.normal(6000 - intensity * 600, 500)),
-                "dwin": max(0.0, rng.normal(6000 - intensity * 550, 500)),
-                "ct_state_ttl": np.clip(rng.normal(2 + intensity, 0.5), 0, 10),
-                "ct_srv_src": max(1.0, rng.poisson(3 + intensity * 5)),
-                "attack_cat": stage,
-            }
-            records.append(values)
-    return pd.DataFrame.from_records(records, columns=[*FEATURE_COLUMNS, "attack_cat"])
+FEATURE_COLUMNS: Final[list[str]] = list(UNSW_NB15_FEATURES)
 
 
-def _load_dataset() -> pd.DataFrame:
-    present_files = [path for path in _DATA_FILES if path.exists()]
-    if not present_files:
-        return _synthetic_dataset()
+class NetworkDataPreprocessor:
+    """Scaler and preprocessor fitted strictly on training data to prevent leakage.
 
-    frames = [pd.read_csv(path) for path in present_files]
-    data = pd.concat(frames, ignore_index=True)
-    missing = [column for column in FEATURE_COLUMNS if column not in data.columns]
-    if "attack_cat" not in data.columns:
-        raise ValueError("UNSW-NB15 CSV must contain an 'attack_cat' column")
-    if missing:
-        raise ValueError(f"UNSW-NB15 CSV is missing features: {', '.join(missing)}")
-    return data
+    Provides mathematical equivalence to StandardScaler or RobustScaler without
+    requiring platform-specific C-extensions (fully compatible with Windows WDAC).
+    """
 
+    def __init__(
+        self,
+        method: str = "standard",
+        feature_columns: Sequence[str] | None = None,
+        clip_range: tuple[float, float] | None = (-10.0, 10.0),
+    ) -> None:
+        self.method = method.lower()
+        self.feature_columns = list(feature_columns) if feature_columns else list(FEATURE_COLUMNS)
+        self.clip_range = clip_range
+        self.center_: np.ndarray | None = None
+        self.scale_: np.ndarray | None = None
+        self.is_fitted: bool = False
+        self.metadata_: dict[str, object] = {}
 
-def _stage_name(value: object) -> str:
-    normalized = str(value).strip().lower()
-    for stage in MITRE_STAGE_MAP:
-        if stage.lower() == normalized:
-            return stage
-    if normalized in {"benign", "normal", "nan", ""}:
-        return "Normal"
-    raise ValueError(f"Unsupported attack_cat label: {value!r}")
+    def fit(self, X: pd.DataFrame | np.ndarray) -> "NetworkDataPreprocessor":
+        """Fit center and scale parameters strictly on training partition."""
+        data = self._to_numpy(X)
+        if data.ndim != 2:
+            raise ValueError(f"Expected 2D input array, got shape {data.shape}")
+        if data.shape[1] != len(self.feature_columns):
+            raise ValueError(
+                f"Expected {len(self.feature_columns)} features, got {data.shape[1]}"
+            )
+
+        if self.method == "standard":
+            center = np.mean(data, axis=0)
+            scale = np.std(data, axis=0)
+            # Avoid division by zero for constant features
+            scale[scale < 1e-6] = 1.0
+        elif self.method == "robust":
+            center = np.median(data, axis=0)
+            q75 = np.percentile(data, 75, axis=0)
+            q25 = np.percentile(data, 25, axis=0)
+            scale = q75 - q25
+            scale[scale < 1e-6] = 1.0
+        else:
+            raise ValueError(f"Unknown scaling method: {self.method}")
+
+        self.center_ = center.astype(np.float32)
+        self.scale_ = scale.astype(np.float32)
+        self.is_fitted = True
+        self.metadata_ = {
+            "method": self.method,
+            "num_features": len(self.feature_columns),
+            "feature_columns": self.feature_columns,
+            "sample_count": int(data.shape[0]),
+        }
+        return self
+
+    def transform(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        """Apply pre-computed scaling parameters without refitting."""
+        if not self.is_fitted or self.center_ is None or self.scale_ is None:
+            raise RuntimeError("Preprocessor has not been fitted yet. Call fit() first.")
+
+        data = self._to_numpy(X)
+        if data.ndim != 2 or data.shape[1] != len(self.feature_columns):
+            raise ValueError(
+                f"Feature mismatch: expected shape (N, {len(self.feature_columns)}), got {data.shape}"
+            )
+
+        scaled = (data - self.center_) / self.scale_
+        if self.clip_range is not None:
+            scaled = np.clip(scaled, self.clip_range[0], self.clip_range[1])
+        return scaled.astype(np.float32)
+
+    def fit_transform(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        """Fit on training data and return scaled array."""
+        return self.fit(X).transform(X)
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        """Reverse scaling transformation."""
+        if not self.is_fitted or self.center_ is None or self.scale_ is None:
+            raise RuntimeError("Preprocessor has not been fitted yet.")
+        return (X * self.scale_) + self.center_
+
+    def save(self, filepath: str | Path = "artifacts/preprocessor.joblib") -> str:
+        """Serialize fitted preprocessor to disk."""
+        if not self.is_fitted:
+            raise RuntimeError("Cannot save an unfitted preprocessor.")
+        dest = Path(filepath)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self, dest)
+        return str(dest)
+
+    @staticmethod
+    def load(filepath: str | Path = "artifacts/preprocessor.joblib") -> "NetworkDataPreprocessor":
+        """Load serialized preprocessor."""
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"Preprocessor artifact not found at {path}")
+        obj = joblib.load(path)
+        if not isinstance(obj, NetworkDataPreprocessor):
+            raise TypeError(f"Loaded object is of type {type(obj)}, expected NetworkDataPreprocessor")
+        return obj
+
+    def _to_numpy(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        if isinstance(X, pd.DataFrame):
+            # Select target columns in order if present
+            cols = [c for c in self.feature_columns if c in X.columns]
+            if len(cols) == len(self.feature_columns):
+                arr = X[self.feature_columns].to_numpy(dtype=np.float32)
+            else:
+                arr = X.to_numpy(dtype=np.float32)
+        else:
+            arr = np.asarray(X, dtype=np.float32)
+        # Handle remaining NaNs/Infs
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
+        return arr
 
 
 def preprocess(
     data: pd.DataFrame | None = None,
+    dataset_name: str = "unsw_nb15",
+    preprocessor: NetworkDataPreprocessor | None = None,
     scaler_path: str | Path = "artifacts/scaler.pkl",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Scale flows and return ``(X, y_probs, y_stage)`` training arrays."""
-    frame = _load_dataset() if data is None else data.copy()
-    missing = [column for column in FEATURE_COLUMNS if column not in frame.columns]
-    if missing or "attack_cat" not in frame.columns:
-        raise ValueError("Input data must contain all 20 numeric features and attack_cat")
+    """Preprocess DataFrame and return (X, y_probs, y_stage) temporal arrays.
 
-    numeric = frame[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    stages = frame["attack_cat"].map(_stage_name).to_numpy()
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(numeric).astype(np.float32)
+    Note: When calling preprocess() on raw full datasets, fit the preprocessor
+    strictly on the training split before transforming validation/test sets.
+    """
+    if data is None:
+        data_path = Path("data/sample_demo.csv")
+        if not data_path.exists():
+            raise FileNotFoundError(
+                "No input data provided and data/sample_demo.csv does not exist. "
+                "Download or provide official dataset files before training."
+            )
+        data = pd.read_csv(data_path)
 
-    destination = Path(scaler_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(scaler, destination)
+    features = extract_features(data, dataset_name=dataset_name)
 
-    sample_count = len(frame) - WINDOW_SIZE - FORECAST_STEPS + 1
+    # Determine stage and attack targets
+    if "attack_cat" in data.columns:
+        stages = map_stage_labels(data["attack_cat"], dataset_name=dataset_name).to_numpy()
+    elif "label" in data.columns:
+        stages = np.where(data["label"].to_numpy() == 0, "Normal", "Generic")
+    else:
+        stages = np.array(["Normal"] * len(data))
+
+    if preprocessor is None:
+        preprocessor = NetworkDataPreprocessor(feature_columns=list(features.columns))
+        scaled = preprocessor.fit_transform(features)
+        preprocessor.save(scaler_path)
+    else:
+        scaled = preprocessor.transform(features)
+
+    sample_count = len(data) - WINDOW_SIZE - FORECAST_STEPS + 1
     if sample_count <= 0:
         raise ValueError(
-            f"At least {WINDOW_SIZE + FORECAST_STEPS} chronological rows are required"
+            f"At least {WINDOW_SIZE + FORECAST_STEPS} rows required for windowing; got {len(data)}"
         )
-    X = np.stack(
-        [scaled[index : index + WINDOW_SIZE] for index in range(sample_count)]
-    )
+
+    X = np.stack([scaled[i : i + WINDOW_SIZE] for i in range(sample_count)])
     future_stages = np.stack(
-        [
-            stages[index + WINDOW_SIZE : index + WINDOW_SIZE + FORECAST_STEPS]
-            for index in range(sample_count)
-        ]
+        [stages[i + WINDOW_SIZE : i + WINDOW_SIZE + FORECAST_STEPS] for i in range(sample_count)]
     )
     y_probs = (future_stages != "Normal").astype(np.float32)
+
     stage_indices = {stage: index for index, stage in enumerate(MITRE_STAGE_MAP)}
     y_stage = np.asarray(
-        [stage_indices[future[0]] for future in future_stages], dtype=np.int64
+        [stage_indices.get(future[0], 0) for future in future_stages], dtype=np.int64
     )
     return X, y_probs, y_stage
-
-
-def export_demo_sample(
-    out_path: str | Path = "data/sample_demo.csv", rows: int = 500
-) -> None:
-    """Export a chronological multi-stage flow sample for offline demonstrations."""
-    if rows < 1:
-        raise ValueError("rows must be positive")
-    demo = _synthetic_dataset(rows_per_stage=max(1, int(np.ceil(rows / len(_STAGES)))))
-    demo = demo.iloc[:rows].copy()
-    destination = Path(out_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    demo.to_csv(destination, index=False)
-
-
-if __name__ == "__main__":
-    X, y_probs, y_stage = preprocess()
-    export_demo_sample()
-    print(f"Prepared X={X.shape}, y_probs={y_probs.shape}, y_stage={y_stage.shape}")
-    print("Saved artifacts/scaler.pkl and data/sample_demo.csv")
