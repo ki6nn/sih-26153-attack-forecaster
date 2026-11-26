@@ -10,29 +10,148 @@ import pandas as pd
 from src.contracts import FORECAST_STEPS, WINDOW_SIZE
 
 
+def verify_temporal_isolation(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    timestamp_col: str = "datetime",
+    duration_col: str | None = None,
+    duration_unit: str = "s",
+) -> dict[str, Any]:
+    """Verify that training flows/targets strictly end before validation flows begin,
+
+    and validation flows/targets strictly end before test flows begin.
+
+    Args:
+        train_df: Training partition.
+        val_df: Validation partition.
+        test_df: Test partition.
+        timestamp_col: Column name containing flow start timestamps.
+        duration_col: Optional column name containing flow durations.
+        duration_unit: 's' for seconds, 'us' for microseconds.
+
+    Returns:
+        Audit dictionary with exact boundary timestamps and verified isolation gaps.
+
+    Raises:
+        ValueError: If temporal boundary violation, leakage, or overlap is detected.
+    """
+    for name, partition in (("Train", train_df), ("Validation", val_df), ("Test", test_df)):
+        if len(partition) == 0:
+            raise ValueError(f"Partition '{name}' is empty. Cannot verify temporal isolation.")
+        if timestamp_col not in partition.columns:
+            raise ValueError(f"Partition '{name}' is missing timestamp column '{timestamp_col}'.")
+        if partition[timestamp_col].isna().any():
+            raise ValueError(f"Partition '{name}' contains null or NaT timestamp values.")
+        if not partition[timestamp_col].is_monotonic_increasing:
+            raise ValueError(f"Partition '{name}' is not monotonically sorted by timestamp.")
+
+    def _compute_flow_end_times(part: pd.DataFrame) -> pd.Series:
+        start_ts = part[timestamp_col]
+        if duration_col and duration_col in part.columns:
+            durations = pd.to_numeric(part[duration_col], errors="coerce").fillna(0.0)
+            if duration_unit.lower() in {"us", "microsecond", "microseconds"}:
+                if pd.api.types.is_datetime64_any_dtype(start_ts):
+                    return start_ts + pd.to_timedelta(durations, unit="us")
+                return start_ts + (durations / 1e6)
+            # Default seconds
+            if pd.api.types.is_datetime64_any_dtype(start_ts):
+                return start_ts + pd.to_timedelta(durations, unit="s")
+            return start_ts + durations
+        return start_ts
+
+    train_end_time = _compute_flow_end_times(train_df).max()
+    val_start_time = val_df[timestamp_col].min()
+    val_end_time = _compute_flow_end_times(val_df).max()
+    test_start_time = test_df[timestamp_col].min()
+
+    # 1. Strict precedence: all training activity ends before validation activity starts
+    if train_end_time >= val_start_time:
+        raise ValueError(
+            f"Temporal Leakage Detected! Training flow activity ends at {train_end_time}, "
+            f"which overlaps or exceeds validation start at {val_start_time}."
+        )
+
+    # 2. Strict precedence: all validation activity ends before test activity starts
+    if val_end_time >= test_start_time:
+        raise ValueError(
+            f"Temporal Leakage Detected! Validation flow activity ends at {val_end_time}, "
+            f"which overlaps or exceeds test start at {test_start_time}."
+        )
+
+    # 3. Duplicate timestamp collision check across partition boundaries
+    train_ts_set = set(train_df[timestamp_col].unique())
+    val_ts_set = set(val_df[timestamp_col].unique())
+    test_ts_set = set(test_df[timestamp_col].unique())
+
+    train_val_overlap = train_ts_set.intersection(val_ts_set)
+    if train_val_overlap:
+        raise ValueError(
+            f"Temporal Boundary Collision! Duplicate timestamps shared between Train and Validation: "
+            f"{list(train_val_overlap)[:3]}"
+        )
+
+    val_test_overlap = val_ts_set.intersection(test_ts_set)
+    if val_test_overlap:
+        raise ValueError(
+            f"Temporal Boundary Collision! Duplicate timestamps shared between Validation and Test: "
+            f"{list(val_test_overlap)[:3]}"
+        )
+
+    return {
+        "is_temporally_isolated": True,
+        "train_range": (str(train_df[timestamp_col].min()), str(train_end_time)),
+        "val_range": (str(val_start_time), str(val_end_time)),
+        "test_range": (str(test_start_time), str(test_df[timestamp_col].max())),
+        "train_val_gap_seconds": (
+            (val_start_time - train_end_time).total_seconds()
+            if hasattr(val_start_time - train_end_time, "total_seconds")
+            else float(val_start_time - train_end_time)
+        ),
+        "val_test_gap_seconds": (
+            (test_start_time - val_end_time).total_seconds()
+            if hasattr(test_start_time - val_end_time, "total_seconds")
+            else float(test_start_time - val_end_time)
+        ),
+    }
+
+
 def chronological_split(
     df: pd.DataFrame,
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
     timestamp_col: str | None = None,
-    buffer_size: int = WINDOW_SIZE + FORECAST_STEPS - 1,
+    duration_col: str | None = None,
+    duration_unit: str = "s",
+    min_gap_seconds: float = 0.0,
+    buffer_size: int | None = None,
+    allow_index_fallback: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Partition a DataFrame strictly by chronological order with safety boundary exclusions.
+    """Partition a DataFrame strictly by chronological time intervals and session end times.
+
+    Guarantees:
+        - Training flow activity (start + duration) strictly ends before validation begins.
+        - Validation flow activity strictly ends before test begins.
+        - Duplicate timestamps at partition boundaries are never split across sets.
+        - Partitions are verified via verify_temporal_isolation() before returning.
 
     Args:
-        df: Input DataFrame (must be chronologically ordered).
-        train_ratio: Fraction of records allocated to training (default: 0.70).
-        val_ratio: Fraction of records allocated to validation (default: 0.15).
-        timestamp_col: Optional column name holding timestamps. If provided, ensures
-            identical timestamps are never split across partition boundaries.
-        buffer_size: Minimum number of records to discard at partition boundaries
-            to prevent sliding-window sequence lookahead or state contamination.
+        df: Input DataFrame.
+        train_ratio: Ratio for training set (default: 0.70).
+        val_ratio: Ratio for validation set (default: 0.15).
+        timestamp_col: Column name holding flow timestamps. If None, auto-detected.
+        duration_col: Column name holding flow duration (e.g. 'dur' or 'flow_duration').
+        duration_unit: 's' for seconds (UNSW-NB15) or 'us' for microseconds (CIC-IDS2017).
+        min_gap_seconds: Optional additional elapsed-time separation between partitions.
+        buffer_size: Optional minimum row buffer count.
+        allow_index_fallback: If True, permits row-index splitting ONLY when timestamps
+            are absent (e.g. synthetic demo smoke testing). Prohibited for research benchmarks.
 
     Returns:
         Tuple of (train_df, val_df, test_df).
 
     Raises:
-        ValueError: If ratios are invalid or dataset has insufficient records.
+        ValueError: If temporal ordering is violated, isolation fails, or partitions are empty.
     """
     total_len = len(df)
     if train_ratio <= 0.0 or val_ratio <= 0.0 or (train_ratio + val_ratio) >= 1.0:
@@ -41,41 +160,175 @@ def chronological_split(
             f"Sum must be strictly less than 1.0."
         )
 
-    min_required = 3 * (WINDOW_SIZE + FORECAST_STEPS) + 2 * buffer_size
-    if total_len < min_required:
-        raise ValueError(
-            f"Dataset length ({total_len}) is too short for safe chronological splitting. "
-            f"Minimum required rows: {min_required}."
+    # 1. Detect or validate timestamp column
+    ts_col = timestamp_col
+    if ts_col is None:
+        for candidate in ["datetime", "timestamp", "stime", "flow_start_time", "time"]:
+            if candidate in df.columns:
+                ts_col = candidate
+                break
+
+    # Handle fallback if no timestamps are present
+    if ts_col is None:
+        if not allow_index_fallback:
+            raise ValueError(
+                "No valid timestamp column found in DataFrame. True temporal isolation "
+                "requires flow timestamps (e.g. 'datetime', 'timestamp', 'stime'). "
+                "Set allow_index_fallback=True only for non-research offline smoke testing."
+            )
+        # Mechanical index fallback for synthetic demo data
+        row_buffer = buffer_size if buffer_size is not None else (WINDOW_SIZE + FORECAST_STEPS - 1)
+        train_end = int(total_len * train_ratio)
+        val_start = train_end + row_buffer
+        val_end = int(total_len * (train_ratio + val_ratio))
+        test_start = val_end + row_buffer
+        if val_start >= val_end or test_start >= total_len:
+            raise ValueError("Insufficient rows for index fallback splitting.")
+        return (
+            df.iloc[:train_end].copy().reset_index(drop=True),
+            df.iloc[val_start:val_end].copy().reset_index(drop=True),
+            df.iloc[test_start:].copy().reset_index(drop=True),
         )
 
-    train_end = int(total_len * train_ratio)
-    val_start = train_end + buffer_size
-    val_end = int(total_len * (train_ratio + val_ratio))
-    test_start = val_end + buffer_size
+    # 2. Strict timestamp validations
+    if df[ts_col].isna().any():
+        raise ValueError(f"Timestamp column '{ts_col}' contains null/NaT values. Data must be sanitized first.")
+    if not df[ts_col].is_monotonic_increasing:
+        raise ValueError(f"DataFrame is not sorted chronologically by '{ts_col}'. Sort before splitting.")
 
-    # Guard against splitting across duplicate timestamps at boundary
-    if timestamp_col and timestamp_col in df.columns:
-        ts_series = df[timestamp_col]
-        # If train_end falls in a group of duplicate timestamps, push val_start past that timestamp
-        train_ts = ts_series.iloc[train_end - 1]
-        while val_start < total_len and ts_series.iloc[val_start] == train_ts:
-            val_start += 1
+    # 3. Compute flow completion times accounting for duration
+    start_ts = df[ts_col]
+    if duration_col and duration_col in df.columns:
+        durations = pd.to_numeric(df[duration_col], errors="coerce").fillna(0.0)
+        if duration_unit.lower() in {"us", "microsecond", "microseconds"}:
+            if pd.api.types.is_datetime64_any_dtype(start_ts):
+                end_ts = start_ts + pd.to_timedelta(durations, unit="us")
+            else:
+                end_ts = start_ts + (durations / 1e6)
+        else:
+            if pd.api.types.is_datetime64_any_dtype(start_ts):
+                end_ts = start_ts + pd.to_timedelta(durations, unit="s")
+            else:
+                end_ts = start_ts + durations
+    else:
+        end_ts = start_ts
 
-        val_ts = ts_series.iloc[val_end - 1] if val_end - 1 < total_len else None
-        if val_ts is not None:
-            while test_start < total_len and ts_series.iloc[test_start] == val_ts:
-                test_start += 1
-
-    if val_start >= val_end or test_start >= total_len:
+    # 4. Determine initial split targets
+    min_rows_per_split = WINDOW_SIZE + FORECAST_STEPS
+    min_total_required = min_rows_per_split * 3
+    if total_len < min_total_required:
         raise ValueError(
-            f"Insufficient records to accommodate buffer_size={buffer_size} between partitions. "
-            f"Rows: {total_len}, train_end: {train_end}, val_range: [{val_start}, {val_end}], "
-            f"test_start: {test_start}"
+            f"Dataset length ({total_len}) is insufficient. Minimum {min_total_required} rows required."
         )
 
-    train_df = df.iloc[:train_end].copy().reset_index(drop=True)
-    val_df = df.iloc[val_start:val_end].copy().reset_index(drop=True)
-    test_df = df.iloc[test_start:].copy().reset_index(drop=True)
+    # Find train boundary: keep duplicate timestamps together
+    target_train_idx = max(min_rows_per_split, int(total_len * train_ratio))
+    cut_ts = start_ts.iloc[target_train_idx - 1]
+    # Advance to end of the duplicate timestamp group
+    k1 = target_train_idx - 1
+    while k1 + 1 < total_len and start_ts.iloc[k1 + 1] == cut_ts:
+        k1 += 1
+
+    # If advancing past cut_ts leaves insufficient rows for val and test, try ending before cut_ts
+    if (total_len - (k1 + 1)) < 2 * min_rows_per_split:
+        first_cut_idx = int(start_ts.searchsorted(cut_ts, side="left"))
+        if first_cut_idx >= min_rows_per_split:
+            k1 = first_cut_idx - 1
+        else:
+            raise ValueError(
+                f"Duplicate timestamp cluster at {cut_ts} is too large to partition. "
+                f"Cannot allocate minimum {min_rows_per_split} rows to each partition."
+            )
+
+    train_slice = df.iloc[: k1 + 1]
+    # Max completion time in training
+    train_max_completion = end_ts.iloc[: k1 + 1].max()
+    if min_gap_seconds > 0:
+        if pd.api.types.is_datetime64_any_dtype(train_max_completion):
+            train_max_completion = train_max_completion + pd.to_timedelta(min_gap_seconds, unit="s")
+        else:
+            train_max_completion = train_max_completion + min_gap_seconds
+
+    # Validation must start at the first record whose start time is strictly AFTER train_max_completion
+    val_start_idx = k1 + 1
+    while val_start_idx < total_len and start_ts.iloc[val_start_idx] <= train_max_completion:
+        val_start_idx += 1
+
+    # Apply row buffer if explicitly requested
+    if buffer_size is not None and (val_start_idx - (k1 + 1)) < buffer_size:
+        val_start_idx = k1 + 1 + buffer_size
+        while val_start_idx < total_len and start_ts.iloc[val_start_idx] <= train_max_completion:
+            val_start_idx += 1
+
+    # Find validation end boundary
+    target_val_idx = max(val_start_idx + min_rows_per_split, int(total_len * (train_ratio + val_ratio)))
+    if target_val_idx >= total_len - min_rows_per_split:
+        # Adjust target_val_idx to fit between val_start_idx and test
+        target_val_idx = val_start_idx + min_rows_per_split
+
+    if target_val_idx >= total_len:
+        raise ValueError(
+            f"Cannot allocate isolated validation partition. Validation target index ({target_val_idx}) "
+            f"exceeds dataset size ({total_len})."
+        )
+
+    val_cut_ts = start_ts.iloc[target_val_idx - 1]
+    k2 = target_val_idx - 1
+    while k2 + 1 < total_len and start_ts.iloc[k2 + 1] == val_cut_ts:
+        k2 += 1
+
+    # If advancing past val_cut_ts leaves insufficient rows for test, try ending before val_cut_ts
+    if (total_len - (k2 + 1)) < min_rows_per_split:
+        first_val_cut_idx = int(start_ts.searchsorted(val_cut_ts, side="left"))
+        if (first_val_cut_idx - val_start_idx) >= min_rows_per_split:
+            k2 = first_val_cut_idx - 1
+        else:
+            raise ValueError(
+                f"Duplicate timestamp cluster at {val_cut_ts} is too large to partition. "
+                f"Leaves insufficient records for test partition."
+            )
+
+    val_slice = df.iloc[val_start_idx : k2 + 1]
+    val_max_completion = end_ts.iloc[val_start_idx : k2 + 1].max()
+    if min_gap_seconds > 0:
+        if pd.api.types.is_datetime64_any_dtype(val_max_completion):
+            val_max_completion = val_max_completion + pd.to_timedelta(min_gap_seconds, unit="s")
+        else:
+            val_max_completion = val_max_completion + min_gap_seconds
+
+    # Test must start at the first record whose start time is strictly AFTER val_max_completion
+    test_start_idx = k2 + 1
+    while test_start_idx < total_len and start_ts.iloc[test_start_idx] <= val_max_completion:
+        test_start_idx += 1
+
+    if buffer_size is not None and (test_start_idx - (k2 + 1)) < buffer_size:
+        test_start_idx = k2 + 1 + buffer_size
+        while test_start_idx < total_len and start_ts.iloc[test_start_idx] <= val_max_completion:
+            test_start_idx += 1
+
+    test_slice = df.iloc[test_start_idx :]
+
+    # 5. Enforce minimum partition lengths
+    if len(train_slice) < min_rows_per_split:
+        raise ValueError(f"Training partition has {len(train_slice)} rows; minimum {min_rows_per_split} required.")
+    if len(val_slice) < min_rows_per_split:
+        raise ValueError(f"Validation partition has {len(val_slice)} rows; minimum {min_rows_per_split} required.")
+    if len(test_slice) < min_rows_per_split:
+        raise ValueError(f"Test partition has {len(test_slice)} rows; minimum {min_rows_per_split} required.")
+
+    # 6. Active production temporal verification
+    train_df = train_slice.copy().reset_index(drop=True)
+    val_df = val_slice.copy().reset_index(drop=True)
+    test_df = test_slice.copy().reset_index(drop=True)
+
+    verify_temporal_isolation(
+        train_df,
+        val_df,
+        test_df,
+        timestamp_col=ts_col,
+        duration_col=duration_col,
+        duration_unit=duration_unit,
+    )
 
     return train_df, val_df, test_df
 
@@ -180,29 +433,3 @@ def create_network_windows(
         y_next_stage.astype(np.int64),
         interval_df,
     )
-
-
-def verify_temporal_isolation(
-    train_targets_end: Any,
-    val_inputs_start: Any,
-    val_targets_end: Any,
-    test_inputs_start: Any,
-) -> bool:
-    """Explicitly verify that training targets never overlap validation inputs,
-
-    and validation targets never overlap test inputs.
-
-    Raises:
-        ValueError: If temporal boundary violation is detected.
-    """
-    if train_targets_end >= val_inputs_start:
-        raise ValueError(
-            f"Temporal Leakage Detected! Training target end ({train_targets_end}) "
-            f"must strictly precede validation input start ({val_inputs_start})."
-        )
-    if val_targets_end >= test_inputs_start:
-        raise ValueError(
-            f"Temporal Leakage Detected! Validation target end ({val_targets_end}) "
-            f"must strictly precede test input start ({test_inputs_start})."
-        )
-    return True
